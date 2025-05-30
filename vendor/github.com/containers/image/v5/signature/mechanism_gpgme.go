@@ -7,10 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/containers/image/v5/signature/internal"
 	"github.com/proglottis/gpgme"
 )
+
+// serialize gpgme calls
+var gpgmeMutex sync.Mutex
 
 // A GPG/OpenPGP signing mechanism, implemented using gpgme.
 type gpgmeSigningMechanism struct {
@@ -69,6 +73,8 @@ func newEphemeralGPGSigningMechanism(blobs [][]byte) (signingMechanismWithPassph
 
 // newGPGMEContext returns a new *gpgme.Context, using optionalDir if not empty.
 func newGPGMEContext(optionalDir string) (*gpgme.Context, error) {
+	gpgmeMutex.Lock()
+	defer gpgmeMutex.Unlock()
 	ctx, err := gpgme.New()
 	if err != nil {
 		return nil, err
@@ -88,9 +94,13 @@ func newGPGMEContext(optionalDir string) (*gpgme.Context, error) {
 }
 
 func (m *gpgmeSigningMechanism) Close() error {
+	gpgmeMutex.Lock()
+	defer gpgmeMutex.Unlock()
+
 	if m.ephemeralDir != "" {
 		os.RemoveAll(m.ephemeralDir) // Ignore an error, if any
 	}
+	m.ctx.Release()
 	return nil
 }
 
@@ -99,10 +109,14 @@ func (m *gpgmeSigningMechanism) Close() error {
 // NOTE: This may modify long-term state (e.g. key storage in a directory underlying the mechanism);
 // but we do not make this public, it can only be used through newEphemeralGPGSigningMechanism.
 func (m *gpgmeSigningMechanism) importKeysFromBytes(blob []byte) ([]string, error) {
+	gpgmeMutex.Lock()
+	defer gpgmeMutex.Unlock()
+
 	inputData, err := gpgme.NewDataBytes(blob)
 	if err != nil {
 		return nil, err
 	}
+	defer inputData.Close()
 	res, err := m.ctx.Import(inputData)
 	if err != nil {
 		return nil, err
@@ -124,6 +138,9 @@ func (m *gpgmeSigningMechanism) SupportsSigning() error {
 // Sign creates a (non-detached) signature of input using keyIdentity and passphrase.
 // Fails with a SigningNotSupportedError if the mechanism does not support signing.
 func (m *gpgmeSigningMechanism) SignWithPassphrase(input []byte, keyIdentity string, passphrase string) ([]byte, error) {
+	gpgmeMutex.Lock()
+	defer gpgmeMutex.Unlock()
+
 	key, err := m.ctx.GetKey(keyIdentity, true)
 	if err != nil {
 		return nil, err
@@ -132,12 +149,14 @@ func (m *gpgmeSigningMechanism) SignWithPassphrase(input []byte, keyIdentity str
 	if err != nil {
 		return nil, err
 	}
+	defer inputData.Close()
 	var sigBuffer bytes.Buffer
 	sigData, err := gpgme.NewDataWriter(&sigBuffer)
 	if err != nil {
 		return nil, err
 	}
-
+	defer sigData.Close()
+	
 	if passphrase != "" {
 		// Callback to write the passphrase to the specified file descriptor.
 		callback := func(uidHint string, prevWasBad bool, gpgmeFD *os.File) error {
@@ -171,15 +190,20 @@ func (m *gpgmeSigningMechanism) Sign(input []byte, keyIdentity string) ([]byte, 
 
 // Verify parses unverifiedSignature and returns the content and the signer's identity
 func (m *gpgmeSigningMechanism) Verify(unverifiedSignature []byte) (contents []byte, keyIdentity string, err error) {
+	gpgmeMutex.Lock()
+	defer gpgmeMutex.Unlock()
+
 	signedBuffer := bytes.Buffer{}
 	signedData, err := gpgme.NewDataWriter(&signedBuffer)
 	if err != nil {
 		return nil, "", err
 	}
+	defer signedData.Close()
 	unverifiedSignatureData, err := gpgme.NewDataBytes(unverifiedSignature)
 	if err != nil {
 		return nil, "", err
 	}
+	defer unverifiedSignatureData.Close()
 	_, sigs, err := m.ctx.Verify(unverifiedSignatureData, nil, signedData)
 	if err != nil {
 		return nil, "", err
